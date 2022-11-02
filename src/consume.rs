@@ -2,17 +2,18 @@
 use std::{collections::BTreeMap, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use clap::Parser;
 use futures::TryStreamExt;
 use rskafka::{
     client::{
         consumer::{StartOffset, StreamConsumerBuilder},
+        partition::UnknownTopicHandling,
         Client,
     },
     record::{Record, RecordAndOffset},
 };
 use serde::{Serialize, Serializer};
-use time::OffsetDateTime;
 use tokio::{
     fs::File,
     io::{AsyncWrite, AsyncWriteExt, BufWriter},
@@ -103,7 +104,11 @@ pub struct ConsumeCLIConfig {
 
 /// Consume data.
 pub async fn consume(client: Client, config: ConsumeCLIConfig) -> Result<()> {
-    let client = Arc::new(client.partition_client(config.topic, config.partition)?);
+    let client = Arc::new(
+        client
+            .partition_client(config.topic, config.partition, UnknownTopicHandling::Error)
+            .await?,
+    );
 
     let mut consumer_builder = StreamConsumerBuilder::new(client, config.start_offset.into());
     if let Some(min_batch_size) = config.min_batch_size {
@@ -182,22 +187,22 @@ struct ConsumedRecord {
     headers: BTreeMap<String, Vec<u8>>,
 
     /// Timestamp as reported by Kafka.
-    #[serde(with = "time::serde::rfc3339")]
-    timestamp: OffsetDateTime,
+    #[serde(serialize_with = "as_rfc3339")]
+    timestamp: DateTime<Utc>,
 
     /// Estimated uncompressed record size.
     size: usize,
 
     /// Timestamp when the record was received by the client.
-    #[serde(with = "time::serde::rfc3339")]
-    received_at: OffsetDateTime,
+    #[serde(serialize_with = "as_rfc3339")]
+    received_at: DateTime<Utc>,
 }
 
 impl ConsumedRecord {
     /// Converts record into machine-readable form.
     fn new(offset: i64, record: Record) -> Self {
         let size = record.approximate_size();
-        let received_at = OffsetDateTime::now_utc();
+        let received_at = Utc::now();
         Self {
             offset,
             key: record.key,
@@ -268,8 +273,21 @@ where
     ))
 }
 
+/// Helper to write timestamp as RFC3339.
+fn as_rfc3339<S>(ts: &DateTime<Utc>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(
+        &ts.with_timezone(&FixedOffset::east(0))
+            .to_rfc3339_opts(SecondsFormat::AutoSi, true),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
 
     #[test]
@@ -315,8 +333,8 @@ mod tests {
             key: None,
             value: None,
             headers: Default::default(),
-            timestamp: OffsetDateTime::from_unix_timestamp(42).unwrap(),
-            received_at: OffsetDateTime::from_unix_timestamp(1234567890).unwrap(),
+            timestamp: Utc.timestamp_millis(42 * 1_000),
+            received_at: Utc.timestamp_millis(1234567890 * 1_000),
             size: 10,
         };
         let actual = serde_json::to_string_pretty(&record).unwrap();
@@ -336,8 +354,8 @@ mod tests {
             key: Some(b"foo".to_vec()),
             value: Some(b"bar".to_vec()),
             headers: BTreeMap::from([("hello".to_string(), b"world".to_vec())]),
-            timestamp: OffsetDateTime::from_unix_timestamp(42).unwrap(),
-            received_at: OffsetDateTime::from_unix_timestamp(1234567890).unwrap(),
+            timestamp: Utc.timestamp_millis(42 * 1_000),
+            received_at: Utc.timestamp_millis(1234567890 * 1_000),
             size: 10,
         };
         let actual = serde_json::to_string_pretty(&record).unwrap();
